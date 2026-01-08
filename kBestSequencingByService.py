@@ -1,45 +1,40 @@
 import math
+import time
 from collections import defaultdict, deque
 import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
 
-
 class kBestSequencingByService:
 
-    def __init__(self, AgentLocations, GoalLocations, dict_of_map_and_dim, gurobiModel):
+    def __init__(self, AgentLocations, GoalLocations, dict_of_map_and_dim, gurobiModel, timeToOptimize = None):
         self.num_agents, self.num_goals = len(AgentLocations), len(GoalLocations)
         self.nodes_dict = {"All": AgentLocations + GoalLocations, "Total": self.num_agents + self.num_goals}
         self.goal_indices = list(range(self.num_agents, self.nodes_dict["Total"]))
+        self.timeToOptimize = timeToOptimize
 
         self.MapAndDims = dict_of_map_and_dim
-
         self.cost_dict = self.precompute_costs(GoalLocations)
 
         # Create the MILP model with a minimization objective
         self.model = gurobiModel
 
-        # Binary variables x[i,j]: whether there is a path from node i to node j
+        # Binary decision variables: x[i,j] = 1 iff we select a directed arc from node i to goal j
         self.x = self.model.addVars(
             [(i, j) for i in range(self.nodes_dict["Total"]) for j in self.goal_indices if i != j],
-            vtype=GRB.BINARY,
-            name="x"
-        )
+            vtype=GRB.BINARY, name="x")
 
-        # Integer variables t[j]: service time at goal j
-        self.t = self.model.addVars(
-            self.goal_indices,
-            vtype=GRB.INTEGER,
-            lb=0,
-            name="t"
-        )
+        # Service time variables (non-negative integer) : t[j] is the service time at goal j
+        self.t = self.model.addVars(self.goal_indices, vtype=GRB.INTEGER, lb=0, name="t")
+
+        # Flow variables for cycle elimination among goals: f[i,j] is flow on arc (i,j), it must be 0 if x[i,j]=0
+        self.f = self.model.addVars(list(self.x.keys()), vtype=GRB.INTEGER, lb=0, ub=self.num_goals, name="f")
 
         # Objective: minimize the total service time across all goals
         self.model.setObjective(gp.quicksum(self.t[j] for j in self.goal_indices), GRB.MINIMIZE)
 
         # Constraints
         for j in self.goal_indices:
-
             # Constraint 1: each goal must have exactly one incoming edge (visited once)
             self.model.addConstr(gp.quicksum(self.x[i, j] for i in range(self.nodes_dict["Total"]) if i != j) == 1)
 
@@ -65,11 +60,28 @@ class kBestSequencingByService:
                         self.model.addConstr(self.t[j] >= self.t[i] + cost - (1 - self.x[i, j]) * M)
                         self.model.addConstr(self.t[j] <= self.t[i] + cost + (1 - self.x[i, j]) * M)
 
+        # Constraint 5: flow allowed only on selected arcs
+        for (i, j) in self.x.keys():
+            self.model.addConstr(self.f[i, j] <= self.num_goals * self.x[i, j])
+
+        # Constraint 6: each goal consumes 1 unit, inflow - outflow = 1
+        for j in self.goal_indices:
+            inflow = gp.quicksum(self.f[i, j] for i in range(self.nodes_dict["Total"]) if i != j and (i, j) in self.f)
+            outflow = gp.quicksum(self.f[j, k] for k in self.goal_indices if k != j and (j, k) in self.f)
+            self.model.addConstr(inflow - outflow == 1)
+
+        # Constraint 7: all flow originates from agents
+        self.model.addConstr(gp.quicksum(self.f[a, j] for a in range(self.num_agents) for j in self.goal_indices if
+                                         (a, j) in self.f) == self.num_goals)
+
     def __iter__(self):
         return self
 
     def __next__(self):
+        s0 = time.time()
         self.model.optimize()
+        if self.timeToOptimize is not None:
+            self.timeToOptimize.value = time.time() - s0
 
         if self.model.status == GRB.INFEASIBLE or (self.model.status == GRB.TIME_LIMIT and self.model.SolCount == 0):
             return {"Allocations": {}, "Cost": math.inf}
